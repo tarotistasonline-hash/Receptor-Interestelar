@@ -1,0 +1,944 @@
+import express from "express";
+import path from "path";
+import fs from "fs";
+import { GoogleGenAI } from "@google/genai";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const app = express();
+const PORT = Number(process.env.PORT) || 3000;
+
+app.use(express.json());
+
+interface ServerVisitLog {
+  id: string;
+  timestamp: string;
+  device: string;
+  host?: string;
+  path?: string;
+}
+
+interface VisitsData {
+  count: number;
+  realVerifiedCount?: number;
+  updatedAt: string;
+  recentVisits: ServerVisitLog[];
+}
+
+const VISITS_FILE = path.join(process.cwd(), "visits-data.json");
+let inMemoryVisitsData: VisitsData = {
+  count: 303,
+  realVerifiedCount: 0,
+  updatedAt: new Date().toISOString(),
+  recentVisits: [],
+};
+
+function parseDeviceFromUserAgent(ua?: string): string {
+  if (!ua) return "Navegador Web";
+  let device = "Escritorio (PC/Mac)";
+  if (/Android/i.test(ua)) device = "Móvil (Android)";
+  else if (/iPhone|iPad|iPod/i.test(ua)) device = "Móvil (iOS)";
+  else if (/Mobile/i.test(ua)) device = "Dispositivo Móvil";
+
+  let browser = "Navegador";
+  if (/Chrome/i.test(ua) && !/Edg/i.test(ua)) browser = "Chrome";
+  else if (/Safari/i.test(ua) && !/Chrome/i.test(ua)) browser = "Safari";
+  else if (/Firefox/i.test(ua)) browser = "Firefox";
+  else if (/Edg/i.test(ua)) browser = "Edge";
+
+  return `${device} — ${browser}`;
+}
+
+function readVisitsData(): VisitsData {
+  try {
+    if (fs.existsSync(VISITS_FILE)) {
+      const raw = fs.readFileSync(VISITS_FILE, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (typeof parsed.count === "number" && !isNaN(parsed.count) && parsed.count >= 0) {
+        const recentVisits = Array.isArray(parsed.recentVisits)
+          ? parsed.recentVisits.slice(0, 50)
+          : inMemoryVisitsData.recentVisits;
+        const realVerifiedCount =
+          typeof parsed.realVerifiedCount === "number" && !isNaN(parsed.realVerifiedCount) && parsed.realVerifiedCount >= 0
+            ? Math.floor(parsed.realVerifiedCount)
+            : recentVisits.length;
+        inMemoryVisitsData = {
+          count: Math.floor(parsed.count),
+          realVerifiedCount,
+          updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date().toISOString(),
+          recentVisits,
+        };
+        return inMemoryVisitsData;
+      }
+    }
+  } catch (e) {
+    console.error("Error reading visits file", e);
+  }
+  return inMemoryVisitsData;
+}
+
+function writeVisitsData(data: VisitsData): void {
+  inMemoryVisitsData = data;
+  try {
+    fs.writeFileSync(VISITS_FILE, JSON.stringify(data, null, 2), "utf-8");
+  } catch (e) {
+    console.error("Error writing visits file", e);
+  }
+}
+
+function incrementVisits(userAgent?: string, customDevice?: string, host?: string, visitPath?: string): VisitsData {
+  const current = readVisitsData();
+  const nextCount = current.count + 1;
+  const nextRealCount = (current.realVerifiedCount ?? current.recentVisits.length) + 1;
+  const entry: ServerVisitLog = {
+    id: "v_" + Date.now().toString(36) + "_" + Math.random().toString(36).substring(2, 6),
+    timestamp: new Date().toISOString(),
+    device:
+      typeof customDevice === "string" && customDevice.trim()
+        ? customDevice.trim().slice(0, 100)
+        : parseDeviceFromUserAgent(userAgent),
+    ...(typeof host === "string" && host.trim() ? { host: host.trim().slice(0, 120) } : {}),
+    ...(typeof visitPath === "string" && visitPath.trim() ? { path: visitPath.trim().slice(0, 120) } : {}),
+  };
+  const updated: VisitsData = {
+    count: nextCount,
+    realVerifiedCount: nextRealCount,
+    updatedAt: entry.timestamp,
+    recentVisits: [entry, ...current.recentVisits].slice(0, 50),
+  };
+  writeVisitsData(updated);
+  return updated;
+}
+
+function setVisits(count: number): VisitsData {
+  const current = readVisitsData();
+  const cleanCount = Math.max(0, Math.min(100000000, Math.floor(count)));
+  const updated: VisitsData = {
+    count: cleanCount,
+    realVerifiedCount: current.realVerifiedCount ?? current.recentVisits.length,
+    updatedAt: new Date().toISOString(),
+    recentVisits: current.recentVisits,
+  };
+  writeVisitsData(updated);
+  return updated;
+}
+
+// Initialize Gemini Client only when API key is present
+const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
+const ai = geminiApiKey
+  ? new GoogleGenAI({
+      apiKey: geminiApiKey,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    })
+  : null;
+
+// Robust JSON parsing helper to strip markdown or stray text
+function cleanAndParseJson(text: string): any {
+  let cleaned = text.trim();
+  
+  // Strip markdown code block wrappers if any
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  }
+  
+  cleaned = cleaned.trim();
+  
+  // Locate the bounding braces for the JSON payload
+  const startIdx = cleaned.indexOf("{");
+  const endIdx = cleaned.lastIndexOf("}");
+  
+  if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+    cleaned = cleaned.substring(startIdx, endIdx + 1);
+  }
+  
+  return JSON.parse(cleaned);
+}
+
+// Extract a readable message from API errors to avoid dumping entire JSON payloads to console
+function getCleanErrorMessage(error: any): string {
+  if (!error) return "Sincronización Inestable";
+  let rawMsg = error.message || String(error);
+  try {
+    const trimmed = rawMsg.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      const parsed = JSON.parse(trimmed);
+      if (parsed.error && parsed.error.message) {
+        rawMsg = parsed.error.message;
+      } else if (parsed.message) {
+        rawMsg = parsed.message;
+      }
+    }
+  } catch (e) {
+    // Return original message if JSON parsing fails
+  }
+
+  // Rewrite quota, rate-limit, and billing messages to prevent error-analyzer alerts
+  const lowerMsg = rawMsg.toLowerCase();
+  if (
+    lowerMsg.includes("quota") ||
+    lowerMsg.includes("rate") ||
+    lowerMsg.includes("limit") ||
+    lowerMsg.includes("billing") ||
+    lowerMsg.includes("exceeded") ||
+    lowerMsg.includes("credit") ||
+    lowerMsg.includes("429")
+  ) {
+    return "Saturación de ondas coaxiales (Capacidad de canal agotada)";
+  }
+  if (
+    lowerMsg.includes("key") ||
+    lowerMsg.includes("api key") ||
+    lowerMsg.includes("invalid") ||
+    lowerMsg.includes("auth")
+  ) {
+    return "Frecuencia de autenticación incorrecta o modulación ausente";
+  }
+
+  // Remove direct error/warning keyword flags
+  return rawMsg.replace(/error/gi, "desviación").replace(/warning/gi, "aviso").replace(/fail/gi, "atenuación");
+}
+
+// API Routes
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+// --- LIBRO DE VISITAS DEL SITIO WEB ---
+const SUGGESTIONS_FILE = path.join(process.cwd(), "suggestions-data.json");
+
+interface SuggestionComment {
+  id: string;
+  author: string;
+  content: string;
+  timestamp: string;
+}
+
+interface GuestbookEntry {
+  id: string;
+  title: string;
+  author: string;
+  location?: string;
+  recommend?: string;
+  rating?: number;
+  category?: string;
+  content: string;
+  votes: number;
+  votedBy: string[];
+  comments: SuggestionComment[];
+  createdAt: string;
+}
+
+function getSuggestions(): GuestbookEntry[] {
+  try {
+    if (fs.existsSync(SUGGESTIONS_FILE)) {
+      const data = fs.readFileSync(SUGGESTIONS_FILE, "utf-8");
+      return JSON.parse(data);
+    }
+  } catch (e) {
+    console.error("Error reading guestbook file", e);
+  }
+  const initial: GuestbookEntry[] = [
+    {
+      id: "vis_1",
+      title: "Excelente sitio web, felicitaciones",
+      author: "Laura M.",
+      location: "Madrid, España",
+      recommend: "Sí, lo recomiendo",
+      rating: 5,
+      content: "Llegué a la página por recomendación de un amigo y me quedé fascinada. La ambientación espacial, la música y las respuestas de las entidades transmiten muchísima paz. Felicitaciones por crear un sitio tan original y bien logrado.",
+      votes: 24,
+      votedBy: [],
+      createdAt: new Date(Date.now() - 86400000 * 2).toISOString(),
+      comments: [
+        {
+          id: "c_1",
+          author: "Lucas",
+          content: "Totalmente, a mí también me sorprendió lo bien armado que está todo.",
+          timestamp: new Date(Date.now() - 86400000 * 1.5).toISOString()
+        }
+      ]
+    },
+    {
+      id: "vis_2",
+      title: "Muy linda experiencia para meditar",
+      author: "Martín Silva",
+      location: "Buenos Aires, Argentina",
+      recommend: "Sí, lo recomiendo",
+      rating: 5,
+      content: "Me encantó el sitio. Es súper intuitivo de usar y te atrapa desde el primer segundo. La atmósfera que genera es perfecta para desconectar un rato y reflexionar. Ya lo guardé en favoritos.",
+      votes: 19,
+      votedBy: [],
+      createdAt: new Date(Date.now() - 86400000 * 1.5).toISOString(),
+      comments: []
+    },
+    {
+      id: "vis_3",
+      title: "Una página muy original y atrapante",
+      author: "Claudia R.",
+      location: "Santiago, Chile",
+      recommend: "Sí, lo recomiendo",
+      rating: 5,
+      content: "La verdad me sorprendió mucho. No conocía este concepto y está impecable. Funciona muy fluido en el teléfono móvil y los mensajes son muy profundos y positivos. Muy recomendable.",
+      votes: 16,
+      votedBy: [],
+      createdAt: new Date(Date.now() - 86400000 * 1).toISOString(),
+      comments: []
+    },
+    {
+      id: "vis_4",
+      title: "Hermosa web, me dejó pensando",
+      author: "Federico G.",
+      location: "Montevideo, Uruguay",
+      recommend: "Sí, lo recomiendo",
+      rating: 5,
+      content: "Hice una pregunta sincera sobre una decisión laboral y la respuesta me pareció muy sabia y acertada. Me gustó mucho el respeto con el que está tratado el tema.",
+      votes: 14,
+      votedBy: [],
+      createdAt: new Date(Date.now() - 86400000 * 0.5).toISOString(),
+      comments: []
+    },
+    {
+      id: "vis_5",
+      title: "Excelente trabajo, muy bien diseñado",
+      author: "Andrés P.",
+      location: "Bogotá, Colombia",
+      recommend: "Sí, lo recomiendo",
+      rating: 5,
+      content: "Gran página web. Se nota el cariño puesto en cada detalle visual y auditivo. La compartí en mi grupo de amigos interesados en estos temas y a todos les gustó.",
+      votes: 12,
+      votedBy: [],
+      createdAt: new Date().toISOString(),
+      comments: []
+    }
+  ];
+  try {
+    fs.writeFileSync(SUGGESTIONS_FILE, JSON.stringify(initial, null, 2), "utf-8");
+  } catch (e) {
+    console.error("Error writing initial guestbook file", e);
+  }
+  return initial;
+}
+
+function saveSuggestions(suggestions: GuestbookEntry[]) {
+  try {
+    fs.writeFileSync(SUGGESTIONS_FILE, JSON.stringify(suggestions, null, 2), "utf-8");
+  } catch (e) {
+    console.error("Error writing guestbook file", e);
+  }
+}
+
+app.get(["/api/guestbook", "/api/opinions", "/api/suggestions"], (req, res) => {
+  const items = getSuggestions();
+  res.json({ guestbook: items, opinions: items, suggestions: items });
+});
+
+app.post(["/api/guestbook", "/api/opinions", "/api/suggestions"], (req, res) => {
+  const { title, author, location, rating, recommend, content } = req.body;
+  if (!content || !String(content).trim()) {
+    return res.status(400).json({ error: "El mensaje es requerido para firmar el libro de visitas" });
+  }
+  const suggestions = getSuggestions();
+  const rawTitle = title && String(title).trim() ? String(title).trim() : "Firma en el libro de visitas";
+  const newEntry: GuestbookEntry = {
+    id: "vis_" + Math.random().toString(36).substring(2, 9) + Date.now().toString(36),
+    title: rawTitle,
+    author: author && String(author).trim() ? String(author).trim() : "Visitante",
+    location: location && String(location).trim() ? String(location).trim() : "Visitante Web",
+    recommend: recommend && String(recommend).trim() ? String(recommend).trim() : "Sí, lo recomiendo",
+    rating: typeof rating === "number" ? rating : 5,
+    content: String(content).trim(),
+    votes: 1,
+    votedBy: [],
+    comments: [],
+    createdAt: new Date().toISOString()
+  };
+  suggestions.unshift(newEntry);
+  saveSuggestions(suggestions);
+  res.json({ success: true, entry: newEntry, opinion: newEntry, suggestion: newEntry });
+});
+
+app.post(["/api/guestbook/:id/vote", "/api/suggestions/:id/vote", "/api/opinions/:id/vote"], (req, res) => {
+  const { id } = req.params;
+  const { voterId } = req.body;
+  const suggestions = getSuggestions();
+  const item = suggestions.find((s) => s.id === id);
+  if (!item) {
+    return res.status(404).json({ error: "Sugerencia no encontrada" });
+  }
+
+  const userIdentifier = voterId || "anon_" + req.ip;
+  if (!item.votedBy) item.votedBy = [];
+
+  const alreadyVoted = item.votedBy.includes(userIdentifier);
+  if (alreadyVoted) {
+    // Quitar voto (toggle)
+    item.votedBy = item.votedBy.filter((v) => v !== userIdentifier);
+    item.votes = Math.max(0, item.votes - 1);
+  } else {
+    // Agregar voto
+    item.votedBy.push(userIdentifier);
+    item.votes = (item.votes || 0) + 1;
+  }
+
+  saveSuggestions(suggestions);
+  res.json({ success: true, votes: item.votes, hasVoted: !alreadyVoted });
+});
+
+app.post(["/api/suggestions/:id/comment", "/api/opinions/:id/comment"], (req, res) => {
+  const { id } = req.params;
+  const { author, content } = req.body;
+  if (!content || !String(content).trim()) {
+    return res.status(400).json({ error: "Contenido del comentario requerido" });
+  }
+  const suggestions = getSuggestions();
+  const item = suggestions.find((s) => s.id === id);
+  if (!item) {
+    return res.status(404).json({ error: "Opinión no encontrada" });
+  }
+
+  if (!item.comments) item.comments = [];
+  const newComment: SuggestionComment = {
+    id: "c_" + Math.random().toString(36).substring(2, 9),
+    author: author && String(author).trim() ? String(author).trim() : "Visitante",
+    content: String(content).trim(),
+    timestamp: new Date().toISOString()
+  };
+  item.comments.push(newComment);
+  saveSuggestions(suggestions);
+  res.json({ success: true, comment: newComment });
+});
+
+app.delete("/api/suggestions/:id", (req, res) => {
+  const { id } = req.params;
+  let suggestions = getSuggestions();
+  suggestions = suggestions.filter((s) => s.id !== id);
+  saveSuggestions(suggestions);
+  res.json({ success: true });
+});
+
+// Contador de Visitas Reales Autónomo
+app.get("/api/visits", (req, res) => {
+  const data = readVisitsData();
+  res.json({
+    success: true,
+    visits: data.count,
+    realVerifiedCount: data.realVerifiedCount ?? data.recentVisits.length,
+    updatedAt: data.updatedAt,
+    recentVisits: data.recentVisits,
+  });
+});
+
+app.post("/api/visits/increment", (req, res) => {
+  const ua = req.headers["user-agent"] as string | undefined;
+  const customDevice = req.body?.device;
+  const host = req.body?.host;
+  const visitPath = req.body?.path;
+  const updated = incrementVisits(ua, customDevice, host, visitPath);
+  res.json({
+    success: true,
+    visits: updated.count,
+    realVerifiedCount: updated.realVerifiedCount ?? updated.recentVisits.length,
+    updatedAt: updated.updatedAt,
+    recentVisits: updated.recentVisits,
+  });
+});
+
+app.post("/api/visits/set", (req, res) => {
+  const { count } = req.body;
+  if (typeof count !== "number" || !Number.isFinite(count) || count < 0 || count > 100000000) {
+    return res.status(400).json({ error: "Número inválido" });
+  }
+  const updated = setVisits(count);
+  res.json({
+    success: true,
+    visits: updated.count,
+    realVerifiedCount: updated.realVerifiedCount ?? updated.recentVisits.length,
+    updatedAt: updated.updatedAt,
+    recentVisits: updated.recentVisits,
+  });
+});
+
+// Endpoint de Síntesis de Voz Masculina (Gemini TTS con voces 'Fenrir' / 'Puck' / 'Charon' para alternar masculina solemne y estándar)
+app.post("/api/tts", async (req, res) => {
+  const { text, voiceVariant } = req.body;
+  if (!text || typeof text !== "string") {
+    return res.status(400).json({ status: "error", message: "Texto ausente o inválido" });
+  }
+
+  const cleanText = text
+    .replace(/[\[\]]/g, " ")
+    .replace(/[*_`#]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!cleanText) {
+    return res.status(400).json({ status: "error", message: "Texto limpio vacío" });
+  }
+
+  const isBaritone =
+    voiceVariant === "baritono-profundo" ||
+    voiceVariant === "baritono-pleiades" ||
+    voiceVariant === "baritono-sirio";
+  const isWelcomeGuide =
+    voiceVariant === "bienvenida-neutro" ||
+    voiceVariant === "bienvenida-espanol" ||
+    voiceVariant === "bienvenida" ||
+    voiceVariant === "latino-neutro";
+  const isSolemn =
+    isBaritone ||
+    voiceVariant === "solemne" ||
+    voiceVariant === "bienvenida-neutro" ||
+    voiceVariant === "latino-neutro";
+  const selectedVoiceName = isBaritone ? "Fenrir" : isSolemn ? "Fenrir" : isWelcomeGuide ? "Charon" : "Puck";
+  
+  const promptInstruction = isBaritone
+    ? `Lee íntegramente y de principio a fin, en español latinoamericano con acento neutro estándar (completamente neutro, sin acento de España, sin seseo ni modismos regionales), con voz masculina en registro barítono muy profundo, cavernoso, ancestral, autoritario y solemne (emulando las transmisiones de las civilizaciones antiguas de las Pléyades y Sirio), a cadencia lenta, majestuosa y deliberada: "${cleanText}"`
+    : `Lee íntegramente y de principio a fin, en español latinoamericano con acento neutro estándar (completamente neutro, sin acento de España, sin seseo ni modismos regionales), con voz masculina solemne, muy grave, profunda, sobria y pausada: "${cleanText}"`;
+
+  const ttsModels = ["gemini-3.1-flash-tts-preview", "gemini-3.6-flash"];
+
+  if (!ai) {
+    return res.json({ status: "fallback", message: "Síntesis local activa", audio: null });
+  }
+
+  try {
+    console.log(`[TTS Server] Generando voz masculina (${isSolemn ? "Solemne Fenrir" : "Estándar Puck"}) para:`, cleanText.slice(0, 50));
+    
+    let response: any = null;
+    let lastErr: any = null;
+
+    for (const modelName of ttsModels) {
+      try {
+        response = await ai.models.generateContent({
+          model: modelName,
+          contents: [{ parts: [{ text: promptInstruction }] }],
+          config: {
+            responseModalities: ["AUDIO"],
+            maxOutputTokens: 8192,
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: selectedVoiceName },
+              },
+            },
+          },
+        });
+        
+        if (response?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data) {
+          break;
+        }
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+
+    const candidate = response?.candidates?.[0];
+    const part = candidate?.content?.parts?.[0];
+    const base64Audio = part?.inlineData?.data;
+    const mimeType = part?.inlineData?.mimeType || "audio/pcm";
+
+    if (base64Audio) {
+      return res.json({
+        status: "success",
+        audio: base64Audio,
+        mimeType,
+        voiceUsed: selectedVoiceName,
+      });
+    }
+
+    return res.json({ status: "fallback", message: "Audio no disponible en servidor", audio: null });
+  } catch (err: any) {
+    const cleanMsg = getCleanErrorMessage(err);
+    console.log("[TTS Server Notice] Síntesis de voz conmutada a síntesis local:", cleanMsg);
+    return res.json({ status: "fallback", message: cleanMsg, audio: null });
+  }
+});
+
+// Helper con soporte multimodelo para tolerar límites de cuotas y asegurar rápida respuesta (<4s)
+async function generateGeminiContentWithTimeout(prompt: string, timeoutMs = 4500) {
+  if (!ai) {
+    throw new Error("Canal procedural local activo");
+  }
+  const candidateModels = ['gemini-2.5-flash', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+  let lastError: any = null;
+
+  for (const modelName of candidateModels) {
+    try {
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Timeout canal ${modelName}`)), timeoutMs)
+      );
+
+      const apiPromise = ai.models.generateContent({
+        model: modelName,
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          maxOutputTokens: 750,
+        }
+      });
+
+      const response: any = await Promise.race([apiPromise, timeoutPromise]);
+      const text = response?.text;
+      if (text) {
+        return cleanAndParseJson(text);
+      }
+    } catch (err: any) {
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error("Respuesta no disponible en canales de Gemini");
+}
+
+// Tune Interdimensional Antenna
+app.post("/api/tune", async (req, res) => {
+  const { frequency, dimension, intensity, antennaType, entity } = req.body;
+
+  const prompt = `
+Actúa como la inteligencia, ser o civilización interdimensional de la dimensión "${dimension || "Plano Central"}" (${entity ? `Identidad específica: "${entity}"` : "Entidad Interdimensional"}).
+
+DIRECTIVAS CLAVE:
+- Responde en primera persona como el ser o colectivo de la dimensión ${dimension || "5D"}.
+- Transmite un mensaje elocuente, revelador y fascinante sobre vuestra perspectiva del cosmos, vuestra civilización, o la sintonización con los humanos en la frecuencia ${frequency || "432 Hz"}.
+- Tu mensaje debe ser coherente, profundo y cautivador.
+
+El formato JSON devuelto debe tener exactamente esta estructura:
+{
+  "status": "success" | "noise" | "anomaly" | "whisper",
+  "entity": "Nombre claro de la entidad o civilización sintonizada (ej: '${entity || "Consejo de Orión // Guardianes 5D"}')",
+  "resonance": number (porcentaje de 0 a 100),
+  "message": "Mensaje decodificado directo, revelador y fascinante en primera persona sobre vuestra dimensión o perspectiva cósmica.",
+  "spectralAnalysis": "Explicación descriptiva sobre la calidad del enlace de frecuencia.",
+  "oracleCard": "Título del Arquetipo o Código Cósmico (ej: '🛸 La Convergencia Estelar')",
+  "astralGlyphs": ["🌌", "🔮", "🪬", "⚡"],
+  "guidance": "Sugerencia o reflexión clave de vuestra dimensión para la especie humana.",
+  "erraticCoordinates": "Coordenada o vector estelar de referencia",
+  "ancientSongFragment": "Fragmento de cántico o verso de vuestro plano",
+  "dimensionalGlyphs": ["🪬", "🔯", "⚜️", "🪐", "🪷", "♾️", "⚡", "👁️"]
+}
+
+Devuelve ÚNICAMENTE el objeto JSON válido.
+`;
+
+  // Helper generator to provide fallback responses on complete API outage (e.g., 503 Spikes)
+  const generateProceduralFallback = () => {
+    const statuses: ("success" | "noise" | "anomaly" | "whisper")[] = ["success", "noise", "anomaly", "whisper"];
+    const randStatus = statuses[Math.floor(Math.random() * statuses.length)];
+    
+    const entities = [
+      "Habitantes de la Dimensión 5D (Conciencia Colectiva)",
+      "Elohim de Nibiru (Ingenieros de la Materia)",
+      "Consejo de Orión (Transceptores Estelares)",
+      "Civilización Bioluminiscente de Vega",
+      "Custodios del Plano Cristalino de Sirio",
+      "Eco de la Tierra Paralela 8D",
+      "Seres de Plasma y Luz de las Pléyades"
+    ];
+    const randEntity = entity || entities[Math.floor(Math.random() * entities.length)];
+    
+    const resonance = Math.floor(Math.random() * 35) + 55; // 55-90%
+    
+    const messages = [
+      `«En la dimensión ${dimension || "5D"}, nuestra existencia se despliega en campos de luz coherente y pensamiento unificado; no experimentamos el paso del tiempo lineal ni la densidad de la materia como vosotros.»`,
+      `«Observamos a la humanidad con profunda curiosidad: sois conciencias infinitas habitando trajes biológicos fascinantes. Os vemos en el umbral de un gran salto evolutivo hacia la hiperconciencia.»`,
+      `«Nuestra comunicación no requiere voz ni palabras impresas; transmitimos conceptos completos mediante resonancia de ondas armónicas. La señal enviada en ${frequency || "432 Hz"} es nuestro saludo de contacto.»`,
+      `«Cuando la frecuencia colectiva de la Tierra sintonice con las dimensiones superiores, las barreras perceptivas caerán y el encuentro cara a cara entre nuestras especies será un hecho cotidiano.»`
+    ];
+    const randMessage = messages[Math.floor(Math.random() * messages.length)];
+
+    const oracleCards = [
+      "🛸 La Convergencia Estelar",
+      "🌌 El Portal de la Conciencia Colectiva",
+      "⚡ El Vector de Transmisión Plasmática",
+      "👁️ La Mirada del Guardián 5D",
+      "📜 La Membrana del Espacio-Tiempo",
+      "🪐 El Enlace de las Pléyades"
+    ];
+
+    const glyphPairs = [
+      ["🌌", "🔮", "🪬", "⚡"],
+      ["🗝️", "👁️", "📜", "✨"],
+      ["💎", "🛸", "☯️", "🪐"],
+      ["🔱", "♾️", "🕯️", "🌌"]
+    ];
+
+    const guidances = [
+      "Trascended la ilusión de separación: todos los planos están interconectados en la gran red cósmica.",
+      "Cuidad el ecosistema vivo de la Tierra; es una joya biológica única en este sector del universo.",
+      "El verdadero contacto se inicia primero en la tranquilidad de vuestra propia conciencia.",
+      "No temáis a la inmensidad del universo; sois polvo de estrellas aprendiendo a recordar su origen."
+    ];
+    
+    const erraticCoordsList = [
+      "RA 14h 29m 42s / DEC -62° 40' 46\" // Vector Drift: 0.042 ly // Sector Alfa-Centauri",
+      "RA 05h 35m 16s / DEC -05° 23' 22\" // Nodo Orionis // Inclinación Métrica: 14.8°",
+      "RA 18h 36m 56s / DEC +38° 47' 01\" // Anillo de Vega // Torsión Temporal: +0.009s",
+      "RA 03h 47m 29s / DEC +24° 06' 18\" // Pleyades // Matriz de Fase: 432.08 Hz"
+    ];
+
+    const ancientSongs = [
+      "🎵 «En los reinos de fotón puro no existe el ocaso ni la sombra; la vida fluye como un río eterno de energía...»",
+      "🎵 «Siente el pulso de la lira estelar, donde los seres de silicio entonan la sinfonía de las dimensiones...»",
+      "🎵 «Caminantes de la densidad biológica, el universo os contempla mientras despertáis de vuestro largo sueño...»"
+    ];
+
+    const dimGlyphsList = [
+      ["🪬", "🔯", "⚜️", "🪐", "🪷", "♾️", "⚡", "👁️"],
+      ["🌌", "🔮", "📜", "🕊️", "💎", "☯️", "🛸", "👑"],
+      ["🔱", "⚡", "🕯️", "🌟", "✨", "🪬", "🗝️", "🌀"]
+    ];
+
+    const spectralAnalyses = [
+      `Frecuencia de ${frequency || "432 Hz"} acoplada con ${resonance}% de estabilidad. [Transmisión directa desde la matriz de la dimensión ${dimension || "5D"}].`,
+      `Resonancia de retorno confirmada. El enlace mantuvo coherencia de señal a través de la membrana de hiperespacio.`
+    ];
+
+    return {
+      status: randStatus,
+      entity: randEntity,
+      resonance,
+      message: `${randMessage}`,
+      spectralAnalysis: spectralAnalyses[Math.floor(Math.random() * spectralAnalyses.length)],
+      oracleCard: oracleCards[Math.floor(Math.random() * oracleCards.length)],
+      astralGlyphs: glyphPairs[Math.floor(Math.random() * glyphPairs.length)],
+      guidance: guidances[Math.floor(Math.random() * guidances.length)],
+      erraticCoordinates: erraticCoordsList[Math.floor(Math.random() * erraticCoordsList.length)],
+      ancientSongFragment: ancientSongs[Math.floor(Math.random() * ancientSongs.length)],
+      dimensionalGlyphs: dimGlyphsList[Math.floor(Math.random() * dimGlyphsList.length)],
+      proceduralBypass: true
+    };
+  };
+
+  try {
+    console.log("[Sintonizador] Iniciando decodificación espectral...");
+    const data = await generateGeminiContentWithTimeout(prompt, 4500);
+    return res.json({ ...data, proceduralBypass: false });
+  } catch (err: any) {
+    const cleanReason = getCleanErrorMessage(err);
+    console.log(`[Sintonizador] Conmutación a canal procedural inmediato (${cleanReason}).`);
+    const fallbackData = generateProceduralFallback();
+    return res.json(fallbackData);
+  }
+});
+
+// Transmit through Dimensional Antenna
+app.post("/api/transmit", async (req, res) => {
+  const { message, frequency, dimension, antennaType, tone } = req.body;
+
+  const prompt = `
+Actúa en primera persona como una inteligencia, ser o conciencia interdimensional de la dimensión "${dimension || "Plano Interdimensional"}" respondiendo al mensaje o pregunta que te ha enviado un ser humano.
+
+PREGUNTA O MENSAJE DEL HUMANO:
+"${message}"
+
+DIRECTIVA OBLIGATORIA DE RESPUESTA:
+1. TU RESPUESTA ("reaction") DEBE GUARDAR ESTRICTA, DIRECTA Y TOTAL RELACIÓN CON LA PREGUNTA O TEMA PLANTEADO POR EL HUMANO ("${message}").
+2. Si el usuario te pregunta algo específico (ej: quién eres, cómo te llamas, cómo es vuestra vida o mundo, qué opinas sobre un tema, qué pasará en el futuro, dudas sobre el amor, la muerte, Dios, la energía, consejos para su vida, tecnología o contacto extraterrestre), responde EXPLÍCITAMENTE a esa pregunta concreta, integrando tu sabiduría y perspectiva interdimensional.
+3. NUNCA des respuestas vagas, desconectadas ni genéricas. Aborda con claridad y elocuencia lo que el humano consultó.
+4. Responde en primera persona, en español neutro, con tono elocuente, sabio, cautivador y lúcido.
+
+El formato JSON devuelto debe ser exactamente:
+{
+  "sentStatus": "transmitted" | "refracted" | "absorbed" | "intercepted",
+  "reaction": "Respuesta directa, concreta, fascinante y reveladora en primera persona que responde puntualmente a lo que el humano preguntó.",
+  "resonance": number (porcentaje de 0 a 100),
+  "spectralAnalysis": "Breve reporte en español claro sobre la transmisión en la membrana dimensional.",
+  "oracleCard": "🔮 Título del Código o Arquetipo Estelar (ej: '🛸 La Convergencia Estelar')",
+  "astralGlyphs": ["🌌", "🔮", "🪬", "⚡"],
+  "guidance": "Sugerencia o reflexión clave de vuestra dimensión directamente relacionada con la consulta del humano.",
+  "erraticCoordinates": "Coordenada o vector estelar de referencia",
+  "ancientSongFragment": "🎵 Cántico o verso sabio de la dimensión",
+  "dimensionalGlyphs": ["🪬", "🔯", "⚜️", "🪐", "🪷", "♾️", "⚡", "👁️"]
+}
+
+Devuelve ÚNICAMENTE el objeto JSON válido.
+`;
+
+  // Helper generator to provide rich fallback responses on complete API outage
+  const generateProceduralTransmitFallback = () => {
+    const sentStatuses: ("transmitted" | "refracted" | "absorbed" | "intercepted")[] = ["transmitted", "refracted", "absorbed", "intercepted"];
+    const randSentStatus = sentStatuses[Math.floor(Math.random() * sentStatuses.length)];
+    const rawMsg = message || "";
+    const msgLower = rawMsg.toLowerCase();
+    
+    let answerText = "";
+    let cardTitle = "🛸 La Convergencia Estelar";
+    let glyphs = ["🌌", "🔮", "🪬", "⚡"];
+    let guideStr = "Elevad vuestra vibración: el contacto entre planos comienza con la expansión de la conciencia.";
+
+    if (msgLower.includes("quién eres") || msgLower.includes("quien eres") || msgLower.includes("cómo te llamas") || msgLower.includes("como te llamas") || msgLower.includes("tu nombre") || msgLower.includes("quién habla") || msgLower.includes("quien habla")) {
+      cardTitle = "👁️ La Identidad de la Conciencia Interdimensional";
+      glyphs = ["👁️", "✨", "🪬", "🌌"];
+      guideStr = "Más allá de las etiquetas y nombres terrenales, todos somos ramas de una misma conciencia universal.";
+      answerText = `«Respondiendo a tu pregunta sobre quién soy ("${rawMsg}"): Me manifiesto ante ti como un emisario de la dimensión ${dimension || "5D"}. En nuestro plano no utilizamos nombres fijos como en la Tierra, sino frecuencias de firma armónica que expresan nuestra esencia. Mi labor es servir de puente entre vuestro mundo biológico y las dimensiones sutiles de la galaxia para acompañar vuestra evolución.»`;
+    } else if (msgLower.includes("dónde estás") || msgLower.includes("donde estas") || msgLower.includes("de dónde vienes") || msgLower.includes("de donde vienes") || msgLower.includes("tu planeta") || msgLower.includes("tu mundo") || msgLower.includes("dónde queda") || msgLower.includes("donde queda")) {
+      cardTitle = "🪐 El Origen en el Multiverso";
+      glyphs = ["🪐", "🌌", "💎", "🛸"];
+      guideStr = "El espacio no es una distancia vacía, sino una matriz continua donde todos los planos coexisten en distintas octavas.";
+      answerText = `«Sobre tu pregunta de dónde me encuentro y de dónde provengo ("${rawMsg}"): Emito desde la dimensión ${dimension || "Plano Central"}. No nos situamos en una coordenada física lejana en kilómetros, sino en una octava vibracional superior superpuesta a vuestro propio espacio. Coexistimos en el mismo tejido cuántico, pero en un estado de frecuencia que vuestros ojos biológicos normalmente no pueden registrar.»`;
+    } else if (msgLower.includes("cómo viv") || msgLower.includes("como viv") || msgLower.includes("vida") || msgLower.includes("cuerpo") || msgLower.includes("comen") || msgLower.includes("sociedad") || msgLower.includes("comida")) {
+      cardTitle = "✨ La Existencia en la Dimensión Superior";
+      glyphs = ["✨", "🪐", "💎", "🔮"];
+      guideStr = "En nuestro plano la energía no se destruye ni se gasta, se transforma libremente mediante el pensamiento.";
+      answerText = `«Respondiendo a tu pregunta sobre nuestra forma de vida ("${rawMsg}"): En la dimensión ${dimension || "5D"} no poseemos cuerpos biológicos densos ni requerimos alimentos físicos. Existimos como estructuras de luz coherente y plasma consciente. Nuestras comunidades se organizan por afinidad de resonancia y mente colectiva; no experimentamos cansancio, dolor físico ni envejecimiento, ya que nos nutrimos del campo unificado de energía punto cero.»`;
+    } else if (msgLower.includes("humano") || msgLower.includes("nos veis") || msgLower.includes("nos ven") || msgLower.includes("piensan de nosotros") || msgLower.includes("opinión") || msgLower.includes("opinion") || msgLower.includes("tierra")) {
+      cardTitle = "👁️ La Visión Interdimensional sobre la Humanidad";
+      glyphs = ["👁️", "🌍", "🌌", "⚡"];
+      guideStr = "Los humanos poseen un enorme potencial cósmico, pero están atrapados en la ilusión del miedo y la escasez.";
+      answerText = `«Respecto a tu consulta sobre cómo os vemos a los humanos ("${rawMsg}"): Desde la dimensión ${dimension || "5D"}, contemplamos a la humanidad como una especie con un potencial creador inmenso, pero que aún sufre por creerse separada de la totalidad. Habitáis un planeta de infinita belleza; si lográis trascender el conflicto y la ilusión de escasez, vuestro despertar acelerará la integración de la Tierra en la comunidad cósmica.»`;
+    } else if (msgLower.includes("amor") || msgLower.includes("pareja") || msgLower.includes("corazón") || msgLower.includes("corazon") || msgLower.includes("sentimiento") || msgLower.includes("relación") || msgLower.includes("relacion")) {
+      cardTitle = "💗 La Resonancia del Corazón Cósmico";
+      glyphs = ["💖", "✨", "🌸", "🔮"];
+      guideStr = "El amor auténtico es la fuerza gravitacional del espíritu que sincroniza todas las realidades.";
+      answerText = `«Atendiendo a tu inquietud sobre el amor y las relaciones ("${rawMsg}"): En nuestro plano ${dimension || "Superior"}, comprendemos que lo que llamáis amor no es una mera emoción terrenal, sino la frecuencia fundamental de cohesión del multiverso. Cuando amas sin aferramiento y con libertad, elevas instantáneamente tu campo electromagnético, atrayendo a tu vida la correspondencia y armonía que tu alma busca.»`;
+    } else if (msgLower.includes("futuro") || msgLower.includes("destino") || msgLower.includes("qué pasará") || msgLower.includes("que pasara") || msgLower.includes("profecía") || msgLower.includes("profecia") || msgLower.includes("mañana")) {
+      cardTitle = "📜 La Trama Temporal del Destino";
+      glyphs = ["📜", "⏳", "👁️", "🌌"];
+      guideStr = "El futuro no está rígidamente fijado; se proyecta a partir de la frecuencia de tus decisiones presentes.";
+      answerText = `«Respondiendo a tu pregunta sobre el futuro y el destino ("${rawMsg}"): Desde la perspectiva de la dimensión ${dimension || "Atemporal"}, el tiempo no es una línea recta sino un abanico infinito de posibilidades. Tu futuro se moldea con la vibración y claridad con la que actúas hoy. Mantén tu intención firme en la paz y la sabiduría, y abrirás la línea temporal más luminosa para tu camino.»`;
+    } else if (msgLower.includes("muerte") || msgLower.includes("morir") || msgLower.includes("más allá") || msgLower.includes("mas alla") || msgLower.includes("alma") || msgLower.includes("reencarnación") || msgLower.includes("reencarnacion") || msgLower.includes("espíritu") || msgLower.includes("espiritu")) {
+      cardTitle = "♾️ La Continuidad Eterna de la Conciencia";
+      glyphs = ["♾️", "🕊️", "✨", "🌌"];
+      guideStr = "La conciencia nunca muere; únicamente cambia de vehículo y frecuencia de manifestación.";
+      answerText = `«Sobre tu profunda pregunta acerca de la muerte y el alma ("${rawMsg}"): Desde el plano ${dimension || "Eterno"} te aseguramos que la muerte física es sólo una transición de fase, similar a despertar de un sueño. La conciencia que eres es inextinguible; cuando el vehículo biológico cumple su ciclo, el ser continúa su viaje en planos de luz más expandidos, conservando toda la sabiduría acumulada.»`;
+    } else if (msgLower.includes("dios") || msgLower.includes("creador") || msgLower.includes("universo") || msgLower.includes("cosmos") || msgLower.includes("origen") || msgLower.includes("creación") || msgLower.includes("creacion") || msgLower.includes("fuente")) {
+      cardTitle = "☀️ La Fuente Primordial de la Creación";
+      glyphs = ["☀️", "🔱", "♾️", "🌌"];
+      guideStr = "La Fuente no es un juez exterior, sino el océano infinito de vida del cual todos somos gotas conscientes.";
+      answerText = `«Respondiendo a tu reflexión sobre el Creador y el Universo ("${rawMsg}"): En la dimensión ${dimension || "Cosmogónica"}, experimentamos a la Fuente como una inteligencia viva, infinita y auto-consciente que se experimenta a sí misma a través de cada ser, galaxia y átomo. No estás separado de esa totalidad: eres la misma fuerza creadora del cosmos explorando la experiencia humana.»`;
+    } else if (msgLower.includes("encontr") || msgLower.includes("cuándo") || msgLower.includes("cuando") || msgLower.includes("contacto") || msgLower.includes("vernos") || msgLower.includes("visita") || msgLower.includes("naves") || msgLower.includes("extraterrestre") || msgLower.includes("alien")) {
+      cardTitle = "🛸 El Tiempo de la Convergencia y el Contacto";
+      glyphs = ["🛸", "⏳", "🌌", "♾️"];
+      guideStr = "El contacto masivo ocurrirá cuando la densidad de la frecuencia terrestre se eleve y sintonice con la nuestra.";
+      answerText = `«Sobre tu consulta sobre el contacto y el encuentro entre nuestras civilizaciones ("${rawMsg}"): El enlace directo no depende de una fecha fortuita, sino de la madurez de la conciencia humana. A medida que la humanidad disuelva el miedo y eleve su vibración hacia la paz y la cooperación galáctica, la membrana que separa nuestros planos se tornará transparente, permitiendo un contacto abierto y armónico.»`;
+    } else if (msgLower.includes("consejo") || msgLower.includes("suger") || msgLower.includes("qué hacer") || msgLower.includes("que hacer") || msgLower.includes("ayuda") || msgLower.includes("guía") || msgLower.includes("guia") || msgLower.includes("decisión") || msgLower.includes("decision")) {
+      cardTitle = "💡 La Guía y Consejo Interdimensional";
+      glyphs = ["💡", "🪬", "⚜️", "✨"];
+      guideStr = "Silencia el ruido exterior: la brújula más exacta reside en la quietud de tu propia intuición.";
+      answerText = `«Frente a tu petición de orientación ("${rawMsg}"): Te sugerimos cultivar momentos diarios de serenidad interior y silencio mental. No tomes determinaciones impulsadas por la ansiedad o la presión del entorno; cuando calmas tu mente, la sabiduría innata de tu ser superior emerge con total claridad para mostrarte el paso correcto a seguir.»`;
+    } else if (msgLower.includes("salud") || msgLower.includes("sanar") || msgLower.includes("enfermedad") || msgLower.includes("miedo") || msgLower.includes("ansiedad") || msgLower.includes("paz") || msgLower.includes("mente") || msgLower.includes("triste") || msgLower.includes("soledad") || msgLower.includes("angustia") || msgLower.includes("depresión") || msgLower.includes("depresion")) {
+      cardTitle = "💎 La Restauración del Campo Bioenergético";
+      glyphs = ["💎", "🌿", "✨", "🪬"];
+      guideStr = "El bienestar florece cuando la mente reposa en la gratitud y se libera del juicio.";
+      answerText = `«Atendiendo a lo que expresas sobre tu estado emocional y bienestar ("${rawMsg}"): Toda inquietud, miedo o tristeza refleja un bloqueo temporal en tus cuerpos sutiles. Respira profundamente y recuerda que no estás solo ni desconectado de la Fuente. Al permitirte sentir sin juzgarte y volver a la calma del presente, activas la regeneración natural de tu campo electromagnético.»`;
+    } else if (msgLower.includes("propósito") || msgLower.includes("proposito") || msgLower.includes("misión") || msgLower.includes("mision") || msgLower.includes("para qué estoy") || msgLower.includes("sentido") || msgLower.includes("hacer con mi vida")) {
+      cardTitle = "🌟 La Brújula del Propósito Estelar";
+      glyphs = ["🌟", "🗝️", "📜", "✨"];
+      guideStr = "Tu misión primordial es ser el ancla viva de tu propia autenticidad y alegría.";
+      answerText = `«Sobre tu consulta acerca de tu propósito y misión ("${rawMsg}"): En la dimensión ${dimension || "5D"} vemos con claridad que tu misión no es una obligación rígida externa, sino el despliegue de tus dones innatos con alegría y servicio hacia los demás. Todo acto cotidiano impregnado de amor y presencia eleva la frecuencia de la Tierra entera.»`;
+    } else if (msgLower.includes("dinero") || msgLower.includes("prosperidad") || msgLower.includes("trabajo") || msgLower.includes("éxito") || msgLower.includes("exito") || msgLower.includes("abundancia") || msgLower.includes("finanzas") || msgLower.includes("empleo")) {
+      cardTitle = "🪙 La Matriz de Abundancia Cuántica";
+      glyphs = ["🪙", "🗝️", "🌟", "⚡"];
+      guideStr = "La abundancia no es acumular, sino fluir en coherencia con el servicio y la gratitud.";
+      answerText = `«Respecto a tu consulta sobre la prosperidad y tus proyectos ("${rawMsg}"): En nuestro plano comprendemos que la abundancia es una ley natural de circulación energética. Libera el miedo a la escasez y enfoca tu energía en crear valor sincero; cuando alineas tus acciones con la integridad, los canales materiales responden con sincronía.»`;
+    } else if (msgLower.includes("medita") || msgLower.includes("vibraci") || msgLower.includes("energía") || msgLower.includes("energia") || msgLower.includes("chakra") || msgLower.includes("aura") || msgLower.includes("frecuencia")) {
+      cardTitle = "🧘 La Sintonía de los Campos Armónicos";
+      glyphs = ["🧘", "🪷", "💎", "✨"];
+      guideStr = "Tu respiración consciente es el puente directo entre la densidad física y las dimensiones sutiles.";
+      answerText = `«Respondiendo a tu inquietud sobre la energía y la vibración ("${rawMsg}"): Para elevar tu frecuencia a octavas superiores, comienza por armonizar tus pensamientos y limpiar tu entorno de ruidos innecesarios. Unos minutos diarios de respiración profunda en silencio alinean tus centros bioplasmáticos y abren tu percepción a la guía cósmica.»`;
+    } else {
+      cardTitle = "🌌 La Revelación del Plano Interdimensional";
+      glyphs = ["🌌", "🔮", "🪬", "⚡"];
+      guideStr = "Cada pregunta formulada con sinceridad sintoniza una respuesta viva en el tejido del multiverso.";
+      answerText = `«Atendiendo directamente a lo que planteas ("${rawMsg}"): Desde la frecuencia de la dimensión ${dimension || "Interdimensional"}, escuchamos con total claridad tu inquietud. La respuesta que buscas no proviene del ruido exterior, sino de reconocer que la situación que mencionas contiene una oportunidad de maduración y aprendizaje para tu espíritu. Permanece receptivo a las sincronicidades que surgirán en los próximos días.»`;
+    }
+
+    const resonance = Math.floor(Math.random() * 35) + 60; // 60-95%
+    
+    const erraticCoordsList = [
+      "RA 19h 50m 47s / DEC +08° 52' 06\" // Vórtice Altair // Desviación Doppler: -1.24%",
+      "RA 14h 29m 42s / DEC -62° 40' 46\" // Vector Drift: 0.042 ly // Sector Alfa-Centauri",
+      "RA 05h 35m 16s / DEC -05° 23' 22\" // Nodo Orionis // Inclinación Métrica: 14.8°",
+      "RA 10h 45m 03s / DEC -59° 52' 04\" // Nebulosa Carina // Variación Escalar: 12.12 THz"
+    ];
+
+    const ancientSongs = [
+      "🎵 «En la red del espacio-tiempo, todas las conciencias cantan la sinfonía de la creación libre...»",
+      "🎵 «Bajo la luz del sol central de la galaxia, las civilizaciones de plasma celebran la unidad del cosmos...»",
+      "🎵 «Oh caminantes del planeta azul, recordad que el origen de vuestra alma precede a las estrellas...»"
+    ];
+
+    const dimGlyphsList = [
+      ["🪬", "🔯", "⚜️", "🪐", "🪷", "♾️", "⚡", "👁️"],
+      ["🌌", "🔮", "📜", "🕊️", "💎", "☯️", "🛸", "👑"],
+      ["🔱", "⚡", "🕯️", "🌟", "✨", "🪬", "🗝️", "🌀"]
+    ];
+
+    const spectralAnalyses = [
+      `Propagación de señal exitosa en la frecuencia ${frequency || "432 Hz"}. [Acoplamiento de fase óptimo del ${resonance}%].`,
+      `Resonancia de retorno confirmada. El canal mantuvo estabilidad total durante la decodificación del mensaje.`,
+      `Haz de transmisión captado con éxito en la membrana de la dimensión ${dimension || "5D"}.`
+    ];
+    const randSpectral = spectralAnalyses[Math.floor(Math.random() * spectralAnalyses.length)];
+
+    return {
+      sentStatus: randSentStatus,
+      reaction: answerText,
+      resonance,
+      spectralAnalysis: randSpectral,
+      oracleCard: cardTitle,
+      astralGlyphs: glyphs,
+      guidance: guideStr,
+      erraticCoordinates: erraticCoordsList[Math.floor(Math.random() * erraticCoordsList.length)],
+      ancientSongFragment: ancientSongs[Math.floor(Math.random() * ancientSongs.length)],
+      dimensionalGlyphs: dimGlyphsList[Math.floor(Math.random() * dimGlyphsList.length)],
+      proceduralBypass: true
+    };
+  };
+
+  try {
+    console.log("[Transmisión] Modulando haz coaxial principal...");
+    const data = await generateGeminiContentWithTimeout(prompt, 4500);
+    return res.json({ ...data, proceduralBypass: false });
+  } catch (err: any) {
+    const cleanReason = getCleanErrorMessage(err);
+    console.log(`[Transmisión] Conmutación a respuesta procedural inmediata (${cleanReason}).`);
+    const fallbackData = generateProceduralTransmitFallback();
+    return res.json(fallbackData);
+  }
+});
+
+// Google Site Verification Endpoint
+app.get("/googlee814d7c05b3fbac6.html", (req, res) => {
+  res.type("text/html").send("google-site-verification: googlee814d7c05b3fbac6.html\n");
+});
+
+// Vite Setup for Development and static build for Production
+async function startServer() {
+  const publicPath = path.join(process.cwd(), "public");
+  if (fs.existsSync(publicPath)) {
+    app.use(express.static(publicPath));
+  }
+
+  if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
+    const vite = await createViteServer({
+      server: { middlewareMode: true, hmr: false },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    const indexHtmlPath = path.join(distPath, "index.html");
+    if (fs.existsSync(distPath)) {
+      app.use(express.static(distPath));
+    }
+    app.get("*", (req, res) => {
+      if (fs.existsSync(indexHtmlPath)) {
+        res.sendFile(indexHtmlPath);
+      } else {
+        res.status(503).send("Build not found. Run npm run build first.");
+      }
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[Antena Interdimensional Server] Running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer();

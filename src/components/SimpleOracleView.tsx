@@ -416,7 +416,7 @@ export const SimpleOracleView: React.FC<SimpleOracleViewProps> = ({
 
   const getPublicShareUrl = (): string => {
     if (typeof window === "undefined") {
-      return "https://ais-pre-im2zazu34dyt7etegvdrmm-172786148761.us-east1.run.app/";
+      return "https://ais-pre-nyechboxmcgvyajxokompy-172786148761.us-east1.run.app/";
     }
     try {
       const url = new URL(window.location.href);

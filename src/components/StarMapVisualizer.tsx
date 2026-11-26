@@ -284,8 +284,8 @@ export default function StarMapVisualizer({
   const miniSpecCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  // Map viewport states (Pan & Zoom)
-  const [zoom, setZoom] = useState<number>(1.0);
+  // Map viewport states (Pan & Zoom) — Modo Observatorio activo por defecto
+  const [zoom, setZoom] = useState<number>(3.4);
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -293,8 +293,8 @@ export default function StarMapVisualizer({
   const [showCelestialGrid, setShowCelestialGrid] = useState<boolean>(true);
   const [filterDanger, setFilterDanger] = useState<string>("TODOS");
 
-  // Observatory Mode states
-  const [isObservatoryMode, setIsObservatoryMode] = useState<boolean>(false);
+  // Observatory Mode states (activo por defecto)
+  const [isObservatoryMode, setIsObservatoryMode] = useState<boolean>(true);
   const [isTargetLocked, setIsTargetLocked] = useState<boolean>(true);
   const preObservatoryRotateRef = useRef<boolean>(true);
 
@@ -305,16 +305,26 @@ export default function StarMapVisualizer({
   const trailPointsRef = useRef<ContactTrailPoint[]>([]);
 
   // Selection & Inspector State (tracked by ID so live telemetry always updates)
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(() => {
+    const matched = DIMENSION_PRESETS.find(
+      (p) =>
+        currentDimension &&
+        (p.name.toLowerCase().includes(currentDimension.toLowerCase()) ||
+          p.coordinates.toLowerCase().includes(currentDimension.toLowerCase()))
+    );
+    return matched?.id || DIMENSION_PRESETS[0]?.id || null;
+  });
   const [hoveredNode, setHoveredNode] = useState<MapNode | null>(null);
 
   // Camera animation refs (smooth lerp inside animation loop)
   const rotationAngleRef = useRef<number>(0);
-  const currentZoomRef = useRef<number>(1.0);
-  const targetZoomRef = useRef<number>(1.0);
+  const currentZoomRef = useRef<number>(3.4);
+  const targetZoomRef = useRef<number>(3.4);
   const currentPanRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const targetPanRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const dragMovedRef = useRef<boolean>(false);
+  const prevDimensionRef = useRef<string>(currentDimension);
+  const initialPanSnappedRef = useRef<boolean>(false);
 
   // Combine Presets + Logged Custom Dimensions into Map Nodes
   const nodes = useMemo<MapNode[]>(() => {
@@ -431,6 +441,24 @@ export default function StarMapVisualizer({
     },
     [updateZoomTarget]
   );
+
+  // Sync Observatory target when user tunes a different dimension externally
+  useEffect(() => {
+    if (prevDimensionRef.current === currentDimension) return;
+    prevDimensionRef.current = currentDimension;
+    if (!currentDimension) return;
+    const matched = nodes.find(
+      (n) =>
+        n.name.toLowerCase().includes(currentDimension.toLowerCase()) ||
+        n.coordinates.toLowerCase().includes(currentDimension.toLowerCase())
+    );
+    if (matched) {
+      setSelectedNodeId(matched.id);
+      if (isObservatoryMode) {
+        setIsTargetLocked(true);
+      }
+    }
+  }, [currentDimension, nodes, isObservatoryMode]);
 
   // Toggle Observatory Mode
   const toggleObservatoryMode = useCallback(() => {
@@ -623,12 +651,17 @@ export default function StarMapVisualizer({
 
       // If locked on a target in Observatory Mode (and not actively dragging), keep target centered without circular swaying
       if (isObservatoryMode && isTargetLocked && selectedNode && !isDragging) {
-        const targetAngle = selectedNode.angle;
+        const targetAngle = selectedNode.angle + rot;
         const targetDist = Math.min(width, height) * 0.42 * targetZoomRef.current * selectedNode.radiusFactor;
-        targetPanRef.current = {
+        const nextTargetPan = {
           x: -Math.cos(targetAngle) * targetDist,
           y: -Math.sin(targetAngle) * targetDist,
         };
+        targetPanRef.current = nextTargetPan;
+        if (!initialPanSnappedRef.current) {
+          currentPanRef.current = nextTargetPan;
+          initialPanSnappedRef.current = true;
+        }
       }
 
       // Smoothly interpolate pan toward targetPanRef (immediate when dragging)

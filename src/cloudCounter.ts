@@ -194,6 +194,9 @@ export const isCurrentOperatorExcluded = (): boolean => {
     }
   } catch (e) {}
 
+  if (safeStorage.getItem("antena_master_admin") !== "true") {
+    return false;
+  }
   return safeStorage.getItem("antena_operator_excluded") === "true";
 };
 
